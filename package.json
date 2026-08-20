@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-headroom",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "engines": {
     "bb": ">=0.39",
@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "Headroom",
-    "description": "Context budget monitoring — token headroom for BB agent threads.",
+    "description": "Context budget monitoring \u2014 token headroom for BB agent threads.",
     "branding": {
       "icon": "Zap"
     },
