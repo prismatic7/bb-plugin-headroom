@@ -2,16 +2,19 @@
 //
 // Registers `headroom_status` as a native agent tool that reports:
 //   - context window size (model provider cap)
-//   - estimated tokens used (message count × rough average)
+//   - estimated tokens used
 //   - remaining headroom
 //   - recommendation: green / yellow / red
 //
-// Also runs a background monitor that tracks per-thread message counts
-// and logs when a thread crosses the warning threshold.
+// It reads real usage from `thread/contextWindowUsage/updated` events when
+// available and falls back to a message-count × rough-average estimate.
+// Also runs a log-based background monitor that tracks per-thread context
+// usage and logs when a thread crosses the warning threshold. The monitor
+// writes to the plugin log only — it does not inject messages into threads.
 import { type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
-// ─── Model context caps (fallback defaults — bb.sdk.providers may override) ───
+// ─── Model context caps (fallback defaults — real usage events override) ───
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const TOKENS_PER_MESSAGE_ESTIMATE = 500; // rough average across code + chat
@@ -61,9 +64,73 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  const { warningThreshold, criticalThreshold } = await settings.get();
-  const warnPct = parseInt(warningThreshold, 10) || 70;
-  const critPct = parseInt(criticalThreshold, 10) || 85;
+  let { warningThreshold, criticalThreshold } = await settings.get();
+  let warnPct = parseInt(warningThreshold, 10) || 70;
+  let critPct = parseInt(criticalThreshold, 10) || 85;
+
+  // Re-read thresholds on setting changes without a plugin reload.
+  settings.onChange((next) => {
+    warningThreshold = next.warningThreshold;
+    criticalThreshold = next.criticalThreshold;
+    warnPct = parseInt(warningThreshold, 10) || 70;
+    critPct = parseInt(criticalThreshold, 10) || 85;
+    bb.log.info(`[headroom] thresholds updated: warn ${warnPct}%, crit ${critPct}%`);
+  });
+
+  // ── Context usage helpers ─────────────────────────────────────────
+
+  interface UsageReading {
+    usedTokens: number;
+    modelContextWindow: number;
+    estimated: boolean;
+  }
+
+  // Prefer the real context-window usage event; fall back to a
+  // message-count × per-message estimate.
+  async function readContextUsage(threadId: string): Promise<UsageReading | null> {
+    try {
+      // Real usage: most recent thread/contextWindowUsage/updated row.
+      const usageRows = await bb.sdk.threads.events.list({
+        threadId,
+        types: ["thread/contextWindowUsage/updated"],
+        order: "desc",
+        limit: "1",
+      });
+      if (usageRows.length > 0) {
+        const data = (usageRows[0] as any).data as {
+          contextWindowUsage?: {
+            estimated?: boolean;
+            modelContextWindow?: number | null;
+            usedTokens?: number | null;
+          };
+        };
+        const usage = data?.contextWindowUsage;
+        if (usage && typeof usage.usedTokens === "number" && typeof usage.modelContextWindow === "number") {
+          return {
+            usedTokens: usage.usedTokens,
+            modelContextWindow: usage.modelContextWindow || DEFAULT_CONTEXT_WINDOW,
+            estimated: !!usage.estimated,
+          };
+        }
+      }
+    } catch {
+      // fall through to estimate
+    }
+
+    try {
+      // Fallback estimate: count real messages via the conversation outline
+      // (each item is one user/assistant message).
+      const outline = await bb.sdk.threads.conversationOutline({ threadId });
+      const messageCount = outline.items?.length ?? 0;
+      return {
+        usedTokens: messageCount * TOKENS_PER_MESSAGE_ESTIMATE,
+        modelContextWindow: DEFAULT_CONTEXT_WINDOW,
+        estimated: true,
+      };
+    } catch {
+      return null;
+    }
+  }
 
   // ── Agent tool: headroom_status ───────────────────────────────────
 
@@ -80,24 +147,14 @@ export default async function plugin(bb: BbPluginApi) {
         const thread = await bb.sdk.threads.get({ threadId });
         if (!thread) return "headroom_status: thread not found";
 
-        // Count messages from event stream
-        let messageCount = 0;
-        try {
-          const events = await bb.sdk.threads.events.list({ threadId, limit: "500" });
-          messageCount = events.filter(
-            (e: any) => e.role === "user" || e.role === "assistant",
-          ).length;
-        } catch {
-          // Fallback: estimate from what we can get
-          messageCount = (thread as any).eventCount ?? 0;
-        }
-
-        const estimatedTokens = messageCount * TOKENS_PER_MESSAGE_ESTIMATE;
-        const providerName = (thread as any).provider ?? "unknown";
+        const providerName = (thread as any).providerId ?? "unknown";
         const modelName = (thread as any).model;
-        const contextCap = resolveContextCap(providerName, modelName);
-        const pct = Math.round((estimatedTokens / contextCap) * 100);
-        const remaining = contextCap - estimatedTokens;
+
+        const reading = await readContextUsage(threadId);
+        if (!reading) return "headroom_status: could not read context usage for this thread.";
+
+        const pct = Math.round((reading.usedTokens / reading.modelContextWindow) * 100);
+        const remaining = reading.modelContextWindow - reading.usedTokens;
 
         let recommendation: string;
         if (pct >= critPct) {
@@ -112,9 +169,8 @@ export default async function plugin(bb: BbPluginApi) {
           `headroom status for thread ${threadId}:`,
           `  Provider:       ${providerName}`,
           `  Model:          ${modelName ?? "default"}`,
-          `  Context window: ${contextCap.toLocaleString()} tokens`,
-          `  Messages:       ${messageCount}`,
-          `  Est. used:      ${estimatedTokens.toLocaleString()} tokens (${pct}%)`,
+          `  Context window: ${reading.modelContextWindow.toLocaleString()} tokens`,
+          `  Used:           ${reading.usedTokens.toLocaleString()} tokens (${pct}%)${reading.estimated ? " (estimated from message count)" : ""}`,
           `  Est. remaining: ${remaining.toLocaleString()} tokens`,
           `  Recommendation: ${recommendation}`,
         ].join("\n");
@@ -124,64 +180,57 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  // ── Background monitor: watch thread event counts ──────────────────
+  // ── Background monitor: log per-thread context usage ──────────────
+  // Log-based only: watches thread activity and logs when a thread crosses
+  // the warning threshold. It does not inject messages into threads.
 
-  const threadCounts = new Map<string, { count: number; lastWarnedPct: number }>();
+  const lastWarned = new Map<string, number>();
+
+  function checkThreshold(threadId: string) {
+    readContextUsage(threadId).then((reading) => {
+      if (!reading) return;
+      const pct = Math.round((reading.usedTokens / reading.modelContextWindow) * 100);
+      const last = lastWarned.get(threadId) ?? 0;
+      if (pct >= critPct && last < critPct) {
+        bb.log.info(
+          `[headroom] thread ${threadId}: CRITICAL ${pct}% (~${reading.usedTokens.toLocaleString()} tokens)`,
+        );
+        lastWarned.set(threadId, pct);
+      } else if (pct >= warnPct && last < warnPct) {
+        bb.log.info(
+          `[headroom] thread ${threadId}: WARNING ${pct}% (~${reading.usedTokens.toLocaleString()} tokens)`,
+        );
+        lastWarned.set(threadId, pct);
+      }
+    }).catch((err) => {
+      bb.log.warn(`[headroom] monitor check failed for ${threadId}: ${err.message ?? err}`);
+    });
+  }
 
   bb.events.on("thread.created", ({ thread }) => {
-    threadCounts.set(thread.id, { count: 0, lastWarnedPct: 0 });
+    lastWarned.delete(thread.id);
   });
 
   bb.events.on("thread.active", ({ thread }) => {
-    if (!threadCounts.has(thread.id)) {
-      threadCounts.set(thread.id, { count: 0, lastWarnedPct: 0 });
-    }
-    const entry = threadCounts.get(thread.id)!;
-    entry.count += 1;
-    checkThreshold(thread.id, entry);
+    checkThreshold(thread.id);
   });
 
   bb.events.on("thread.idle", ({ thread }) => {
-    const entry = threadCounts.get(thread.id);
-    if (entry) entry.count += 1;
-    checkThreshold(thread.id, entry);
+    checkThreshold(thread.id);
   });
 
   bb.events.on("thread.archived", ({ thread }) => {
-    threadCounts.delete(thread.id);
+    lastWarned.delete(thread.id);
   });
 
   bb.events.on("thread.deleted", ({ thread }) => {
-    threadCounts.delete(thread.id);
+    lastWarned.delete(thread.id);
   });
-
-  function checkThreshold(
-    threadId: string,
-    entry?: { count: number; lastWarnedPct: number },
-  ) {
-    const e = entry ?? threadCounts.get(threadId);
-    if (!e) return;
-
-    const estimatedTokens = e.count * TOKENS_PER_MESSAGE_ESTIMATE;
-    const pct = Math.round((estimatedTokens / DEFAULT_CONTEXT_WINDOW) * 100);
-
-    if (pct >= critPct && e.lastWarnedPct < critPct) {
-      bb.log.info(
-        `[headroom] thread ${threadId}: CRITICAL ${pct}% (~${estimatedTokens.toLocaleString()} tokens)`,
-      );
-      e.lastWarnedPct = pct;
-    } else if (pct >= warnPct && e.lastWarnedPct < warnPct) {
-      bb.log.info(
-        `[headroom] thread ${threadId}: WARNING ${pct}% (~${estimatedTokens.toLocaleString()} tokens)`,
-      );
-      e.lastWarnedPct = pct;
-    }
-  }
 
   // ── Cleanup ──────────────────────────────────────────────────────
 
   bb.onDispose(() => {
-    threadCounts.clear();
+    lastWarned.clear();
     bb.log.info("bb-plugin-headroom disposed");
   });
 }
