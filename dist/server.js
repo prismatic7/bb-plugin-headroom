@@ -14527,27 +14527,6 @@ config(en_default());
 // server.ts
 var DEFAULT_CONTEXT_WINDOW = 128e3;
 var TOKENS_PER_MESSAGE_ESTIMATE = 500;
-var PROVIDER_CAPS = {
-  "claude-3.5-sonnet": 2e5,
-  "claude-3-opus": 2e5,
-  "claude-3-haiku": 2e5,
-  "gpt-4o": 128e3,
-  "gpt-4-turbo": 128e3,
-  "gemini-2.5-pro": 1e6,
-  "gemini-2.5-flash": 1e6,
-  "codestral": 256e3,
-  "deepseek-v3": 128e3,
-  "deepseek-v4": 2e5,
-  "qwen3.5": 128e3,
-  "qwen-coder": 128e3
-};
-function resolveContextCap(providerName, modelName) {
-  const key = modelName?.toLowerCase() ?? providerName.toLowerCase();
-  for (const [k, cap] of Object.entries(PROVIDER_CAPS)) {
-    if (key.includes(k.toLowerCase())) return cap;
-  }
-  return DEFAULT_CONTEXT_WINDOW;
-}
 async function plugin(bb) {
   bb.log.info("bb-plugin-headroom loaded");
   const settings = bb.settings.define({
@@ -14564,9 +14543,49 @@ async function plugin(bb) {
       description: "Log a critical alert when context usage exceeds this percentage."
     }
   });
-  const { warningThreshold, criticalThreshold } = await settings.get();
-  const warnPct = parseInt(warningThreshold, 10) || 70;
-  const critPct = parseInt(criticalThreshold, 10) || 85;
+  let { warningThreshold, criticalThreshold } = await settings.get();
+  let warnPct = parseInt(warningThreshold, 10) || 70;
+  let critPct = parseInt(criticalThreshold, 10) || 85;
+  settings.onChange((next) => {
+    warningThreshold = next.warningThreshold;
+    criticalThreshold = next.criticalThreshold;
+    warnPct = parseInt(warningThreshold, 10) || 70;
+    critPct = parseInt(criticalThreshold, 10) || 85;
+    bb.log.info(`[headroom] thresholds updated: warn ${warnPct}%, crit ${critPct}%`);
+  });
+  async function readContextUsage(threadId) {
+    try {
+      const usageRows = await bb.sdk.threads.events.list({
+        threadId,
+        types: ["thread/contextWindowUsage/updated"],
+        order: "desc",
+        limit: "1"
+      });
+      if (usageRows.length > 0) {
+        const data = usageRows[0].data;
+        const usage = data?.contextWindowUsage;
+        if (usage && typeof usage.usedTokens === "number" && typeof usage.modelContextWindow === "number") {
+          return {
+            usedTokens: usage.usedTokens,
+            modelContextWindow: usage.modelContextWindow || DEFAULT_CONTEXT_WINDOW,
+            estimated: !!usage.estimated
+          };
+        }
+      }
+    } catch {
+    }
+    try {
+      const outline = await bb.sdk.threads.conversationOutline({ threadId });
+      const messageCount = outline.items?.length ?? 0;
+      return {
+        usedTokens: messageCount * TOKENS_PER_MESSAGE_ESTIMATE,
+        modelContextWindow: DEFAULT_CONTEXT_WINDOW,
+        estimated: true
+      };
+    } catch {
+      return null;
+    }
+  }
   bb.agents.registerTool({
     name: "headroom_status",
     description: "Check your context budget: how much of the model's context window is used, estimated tokens remaining, and a recommendation (green/yellow/red). Call this before starting a large batch of work or when you notice the conversation getting long.",
@@ -14575,21 +14594,12 @@ async function plugin(bb) {
       try {
         const thread = await bb.sdk.threads.get({ threadId });
         if (!thread) return "headroom_status: thread not found";
-        let messageCount = 0;
-        try {
-          const events = await bb.sdk.threads.events.list({ threadId, limit: "500" });
-          messageCount = events.filter(
-            (e) => e.role === "user" || e.role === "assistant"
-          ).length;
-        } catch {
-          messageCount = thread.eventCount ?? 0;
-        }
-        const estimatedTokens = messageCount * TOKENS_PER_MESSAGE_ESTIMATE;
-        const providerName = thread.provider ?? "unknown";
+        const providerName = thread.providerId ?? "unknown";
         const modelName = thread.model;
-        const contextCap = resolveContextCap(providerName, modelName);
-        const pct = Math.round(estimatedTokens / contextCap * 100);
-        const remaining = contextCap - estimatedTokens;
+        const reading = await readContextUsage(threadId);
+        if (!reading) return "headroom_status: could not read context usage for this thread.";
+        const pct = Math.round(reading.usedTokens / reading.modelContextWindow * 100);
+        const remaining = reading.modelContextWindow - reading.usedTokens;
         let recommendation;
         if (pct >= critPct) {
           recommendation = "RED \u2014 critical: summarize immediately or start a fresh thread.";
@@ -14602,9 +14612,8 @@ async function plugin(bb) {
           `headroom status for thread ${threadId}:`,
           `  Provider:       ${providerName}`,
           `  Model:          ${modelName ?? "default"}`,
-          `  Context window: ${contextCap.toLocaleString()} tokens`,
-          `  Messages:       ${messageCount}`,
-          `  Est. used:      ${estimatedTokens.toLocaleString()} tokens (${pct}%)`,
+          `  Context window: ${reading.modelContextWindow.toLocaleString()} tokens`,
+          `  Used:           ${reading.usedTokens.toLocaleString()} tokens (${pct}%)${reading.estimated ? " (estimated from message count)" : ""}`,
           `  Est. remaining: ${remaining.toLocaleString()} tokens`,
           `  Recommendation: ${recommendation}`
         ].join("\n");
@@ -14613,48 +14622,44 @@ async function plugin(bb) {
       }
     }
   });
-  const threadCounts = /* @__PURE__ */ new Map();
+  const lastWarned = /* @__PURE__ */ new Map();
+  function checkThreshold(threadId) {
+    readContextUsage(threadId).then((reading) => {
+      if (!reading) return;
+      const pct = Math.round(reading.usedTokens / reading.modelContextWindow * 100);
+      const last = lastWarned.get(threadId) ?? 0;
+      if (pct >= critPct && last < critPct) {
+        bb.log.info(
+          `[headroom] thread ${threadId}: CRITICAL ${pct}% (~${reading.usedTokens.toLocaleString()} tokens)`
+        );
+        lastWarned.set(threadId, pct);
+      } else if (pct >= warnPct && last < warnPct) {
+        bb.log.info(
+          `[headroom] thread ${threadId}: WARNING ${pct}% (~${reading.usedTokens.toLocaleString()} tokens)`
+        );
+        lastWarned.set(threadId, pct);
+      }
+    }).catch((err) => {
+      bb.log.warn(`[headroom] monitor check failed for ${threadId}: ${err.message ?? err}`);
+    });
+  }
   bb.events.on("thread.created", ({ thread }) => {
-    threadCounts.set(thread.id, { count: 0, lastWarnedPct: 0 });
+    lastWarned.delete(thread.id);
   });
   bb.events.on("thread.active", ({ thread }) => {
-    if (!threadCounts.has(thread.id)) {
-      threadCounts.set(thread.id, { count: 0, lastWarnedPct: 0 });
-    }
-    const entry = threadCounts.get(thread.id);
-    entry.count += 1;
-    checkThreshold(thread.id, entry);
+    checkThreshold(thread.id);
   });
   bb.events.on("thread.idle", ({ thread }) => {
-    const entry = threadCounts.get(thread.id);
-    if (entry) entry.count += 1;
-    checkThreshold(thread.id, entry);
+    checkThreshold(thread.id);
   });
   bb.events.on("thread.archived", ({ thread }) => {
-    threadCounts.delete(thread.id);
+    lastWarned.delete(thread.id);
   });
   bb.events.on("thread.deleted", ({ thread }) => {
-    threadCounts.delete(thread.id);
+    lastWarned.delete(thread.id);
   });
-  function checkThreshold(threadId, entry) {
-    const e = entry ?? threadCounts.get(threadId);
-    if (!e) return;
-    const estimatedTokens = e.count * TOKENS_PER_MESSAGE_ESTIMATE;
-    const pct = Math.round(estimatedTokens / DEFAULT_CONTEXT_WINDOW * 100);
-    if (pct >= critPct && e.lastWarnedPct < critPct) {
-      bb.log.info(
-        `[headroom] thread ${threadId}: CRITICAL ${pct}% (~${estimatedTokens.toLocaleString()} tokens)`
-      );
-      e.lastWarnedPct = pct;
-    } else if (pct >= warnPct && e.lastWarnedPct < warnPct) {
-      bb.log.info(
-        `[headroom] thread ${threadId}: WARNING ${pct}% (~${estimatedTokens.toLocaleString()} tokens)`
-      );
-      e.lastWarnedPct = pct;
-    }
-  }
   bb.onDispose(() => {
-    threadCounts.clear();
+    lastWarned.clear();
     bb.log.info("bb-plugin-headroom disposed");
   });
 }
