@@ -83,6 +83,10 @@ export default async function plugin(bb: BbPluginApi) {
     usedTokens: number;
     modelContextWindow: number;
     estimated: boolean;
+    // Where usedTokens came from: the provider's context-window event, or the
+    // message-count fallback below. Providers may flag their own figure as
+    // estimated too, so `estimated` alone cannot tell the two apart.
+    source: "provider" | "message-count";
   }
 
   // Prefer the real context-window usage event; fall back to a
@@ -110,6 +114,7 @@ export default async function plugin(bb: BbPluginApi) {
             usedTokens: usage.usedTokens,
             modelContextWindow: usage.modelContextWindow || DEFAULT_CONTEXT_WINDOW,
             estimated: !!usage.estimated,
+            source: "provider",
           };
         }
       }
@@ -126,6 +131,7 @@ export default async function plugin(bb: BbPluginApi) {
         usedTokens: messageCount * TOKENS_PER_MESSAGE_ESTIMATE,
         modelContextWindow: DEFAULT_CONTEXT_WINDOW,
         estimated: true,
+        source: "message-count",
       };
     } catch {
       return null;
@@ -170,7 +176,7 @@ export default async function plugin(bb: BbPluginApi) {
           `  Provider:       ${providerName}`,
           `  Model:          ${modelName ?? "default"}`,
           `  Context window: ${reading.modelContextWindow.toLocaleString()} tokens`,
-          `  Used:           ${reading.usedTokens.toLocaleString()} tokens (${pct}%)${reading.estimated ? " (estimated from message count)" : ""}`,
+          `  Used:           ${reading.usedTokens.toLocaleString()} tokens (${pct}%)${reading.source === "message-count" ? " (estimated from message count)" : reading.estimated ? " (provider estimate)" : ""}`,
           `  Est. remaining: ${remaining.toLocaleString()} tokens`,
           `  Recommendation: ${recommendation}`,
         ].join("\n");
