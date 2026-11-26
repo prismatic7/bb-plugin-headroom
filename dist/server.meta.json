@@ -3,7 +3,7 @@
   "sdkVersion": "0.6.157",
   "artifactFormatVersion": 1,
   "pluginId": "headroom",
-  "pluginVersion": "0.2.1",
+  "pluginVersion": "0.3.0",
   "builtWith": {
     "bbVersion": "0.50.1",
     "pluginSdkVersion": "0.6.157"
